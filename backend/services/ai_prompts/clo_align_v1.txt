@@ -1,0 +1,7 @@
+Map each question to the best matching CLO from the given CLO list.
+Return JSON only:
+{
+  "per_question":[{"question_no":1,"clo":"CLO-1","confidence":0.82}],
+  "per_clo":{"CLO-1":50,"CLO-2":50},
+  "coverage_percent":100
+}

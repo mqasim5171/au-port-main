@@ -1,0 +1,8 @@
+Grade student answers against expected answers.
+Return JSON only:
+{
+ "total_marks": <number>,
+ "feedback": "<string>",
+ "per_question":[{"question_no":1,"marks_awarded":2,"justification":"...","missing_points":["..."]}]
+}
+Be strict but fair.

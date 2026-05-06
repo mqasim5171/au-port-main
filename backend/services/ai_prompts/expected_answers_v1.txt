@@ -1,0 +1,5 @@
+Generate expected answers for each question.
+Return JSON only.
+Each question must have:
+question_no, expected_answer, key_points (list), marks_split (list of {point, marks}).
+Also include total_questions.
