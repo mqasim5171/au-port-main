@@ -1,0 +1,12 @@
+Week 1 Lecture Material
+Topic: Introduction to Software Engineering
+
+Contents:
+- Definition of software engineering
+- Software crisis
+- Need for engineering discipline in software development
+- Software product types
+- SDLC overview
+- Role of quality assurance in software projects
+
+Linked CLOs: CLO1
