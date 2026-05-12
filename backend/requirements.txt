@@ -1,4 +1,3 @@
---index-url https://download.pytorch.org/whl/cpu
 --extra-index-url https://pypi.org/simple
 
 annotated-types==0.7.0
@@ -14,8 +13,10 @@ lxml==6.0.1
 numpy==2.3.3
 pandas==2.3.2
 pillow==11.3.0
+
+# Let pydantic install compatible pydantic-core automatically
 pydantic==2.11.9
-pydantic_core==2.33.2
+
 PyJWT==2.10.1
 PyMuPDF==1.26.4
 python-dateutil==2.9.0.post0
@@ -34,6 +35,7 @@ typing-inspection==0.4.1
 typing_extensions==4.15.0
 tzdata==2025.2
 uvicorn==0.35.0
+
 psycopg[binary]>=3.1
 alembic>=1.13
 python-dotenv>=1.0
@@ -42,7 +44,9 @@ email-validator>=2.1.0
 pydantic-settings
 passlib[bcrypt]==1.7.4
 
-# --- FIXED NLP STACK FOR MAC ARM & PYTHON 3.13 ---
-torch==2.6.0               # REPLACED 2.5.1 → 2.6.0 (compatible version)
-transformers==4.46.2       # unchanged
+# NLP / AI stack
+transformers==4.46.2
 sentence-transformers==2.7.0
+
+# CPU-only PyTorch
+torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
