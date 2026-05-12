@@ -1,7 +1,0 @@
-Week 1 Lab Task
-Task: Identify functional and non-functional requirements from a small case study.
-
-Instructions:
-Students will read a library management system scenario and list at least five functional and five non-functional requirements.
-
-Linked CLOs: CLO2

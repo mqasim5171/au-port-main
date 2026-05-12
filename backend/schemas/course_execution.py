@@ -1,4 +1,5 @@
 # backend/schemas/course_execution.py
+
 from datetime import datetime
 from typing import Optional, List
 from pydantic import BaseModel
@@ -42,11 +43,9 @@ class WeeklyExecutionBase(BaseModel):
     coverage_status: Optional[str] = "on_track"
     evidence_links: Optional[str] = None
 
-    # ✅ NEW
     coverage_percent: Optional[float] = 0
     missing_topics: Optional[str] = None
     matched_topics: Optional[str] = None
-
 
 
 class WeeklyExecutionCreate(WeeklyExecutionBase):
@@ -87,11 +86,27 @@ class DeviationResolve(BaseModel):
 
 class WeeklyStatusItem(BaseModel):
     week_number: int
-    planned_topics: Optional[str]
-    delivered_topics: Optional[str]
-    planned_assessments: Optional[str]
-    delivered_assessments: Optional[str]
+
+    planned_topics: Optional[str] = None
+    delivered_topics: Optional[str] = None
+
+    planned_assessments: Optional[str] = None
+    delivered_assessments: Optional[str] = None
+
     coverage_status: str
+
+    # Auto evidence from system
+    has_upload: bool = False
+    upload_count: int = 0
+    latest_upload_id: Optional[str] = None
+    latest_upload_name: Optional[str] = None
+    latest_upload_date: Optional[datetime] = None
+
+    assessment_count: int = 0
+    assessment_titles: List[str] = []
+
+    evidence_summary: Optional[str] = None
+    auto_reason: Optional[str] = None
 
 
 class WeeklyStatusSummary(BaseModel):

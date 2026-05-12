@@ -11,8 +11,9 @@ from routers.auth import get_current_user
 
 from models.course import Course
 from models.course_staff import CourseStaff
-from models.assessment import Assessment
+from models.assessment import Assessment, AssessmentFile
 from models.student_submission import StudentSubmission
+from models.uploads import Upload, UploadText
 
 from schemas.assessment import (
     AssessmentCreate,
@@ -28,7 +29,11 @@ from services.assessment_service import (
     ai_clo_alignment,
 )
 
-from services.grading_service import upload_submissions_zip, grade_all
+from services.grading_service import (
+    upload_submissions_zip,
+    upload_single_submission_file,
+    grade_all,
+)
 
 
 router = APIRouter(tags=["Assessments"])
@@ -258,6 +263,51 @@ async def upload_questions_file(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.delete("/assessments/{assessment_id}/questions/{file_id}")
+def delete_question_file(
+    assessment_id: str,
+    file_id: str,
+    db: Session = Depends(get_db),
+    current=Depends(get_current_user),
+):
+    assessment = _get_assessment_or_404(db, assessment_id)
+    _ensure_assessment_access(db, assessment, current)
+
+    fid = _validate_uuid_string(file_id, "file_id")
+
+    assessment_file = (
+        db.query(AssessmentFile)
+        .filter(
+            AssessmentFile.id == fid,
+            AssessmentFile.assessment_id == assessment.id,
+        )
+        .first()
+    )
+
+    if not assessment_file:
+        raise HTTPException(status_code=404, detail="Question file not found")
+
+    upload_id = assessment_file.upload_id
+
+    db.delete(assessment_file)
+
+    if upload_id:
+        upload_text = db.query(UploadText).filter(UploadText.upload_id == upload_id).first()
+        if upload_text:
+            db.delete(upload_text)
+
+        upload = db.get(Upload, upload_id)
+        if upload:
+            db.delete(upload)
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "message": "Question file deleted successfully.",
+    }
+
+
 @router.post("/assessments/{assessment_id}/generate-expected-answers")
 def generate_expected_answers(
     assessment_id: str,
@@ -285,7 +335,7 @@ def generate_expected_answers(
 
 
 # ======================================================
-# STUDENT SUBMISSIONS ZIP + GRADING
+# STUDENT SUBMISSIONS ZIP + SINGLE FILE + GRADING
 # ======================================================
 
 @router.post("/assessments/{assessment_id}/submissions/upload-zip")
@@ -322,6 +372,47 @@ async def upload_submissions(
         return {
             "ok": True,
             "message": "ZIP extracted and submissions processed.",
+            **result,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/assessments/{assessment_id}/submissions/upload-file")
+async def upload_single_submission(
+    assessment_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current=Depends(get_current_user),
+):
+    assessment = _get_assessment_or_404(db, assessment_id)
+    _ensure_assessment_access(db, assessment, current)
+
+    filename = file.filename or "submission.docx"
+
+    if not filename.lower().endswith((".pdf", ".docx", ".txt", ".md")):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF, DOCX, TXT, and MD files are allowed for student submissions.",
+        )
+
+    file_bytes = await file.read()
+
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    try:
+        result = upload_single_submission_file(
+            db=db,
+            assessment=assessment,
+            file_bytes=file_bytes,
+            filename=filename,
+        )
+
+        return {
+            "ok": True,
+            "message": "Single submission uploaded successfully.",
             **result,
         }
 

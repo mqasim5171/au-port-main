@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import api from "../api";
 import { useParams } from "react-router-dom";
 
@@ -159,7 +159,11 @@ const styles = {
 };
 
 function StatusBadge({ ok, children }) {
-  return <span style={ok ? styles.successBadge : styles.dangerBadge}>{children}</span>;
+  return (
+    <span style={ok ? styles.successBadge : styles.dangerBadge}>
+      {children}
+    </span>
+  );
 }
 
 function StepCard({ no, title, status, children }) {
@@ -245,9 +249,14 @@ function statusTone(status) {
 export default function AssessmentDetail() {
   const { id } = useParams();
 
+  const questionInputRef = useRef(null);
+  const zipInputRef = useRef(null);
+  const singleSubmissionInputRef = useRef(null);
+
   const [data, setData] = useState(null);
   const [qFile, setQFile] = useState(null);
   const [zipFile, setZipFile] = useState(null);
+  const [singleSubmissionFile, setSingleSubmissionFile] = useState(null);
 
   const [submissionsRefreshKey, setSubmissionsRefreshKey] = useState(0);
   const [subStats, setSubStats] = useState({
@@ -278,13 +287,14 @@ export default function AssessmentDetail() {
     setMessage("");
 
     if (!qFile) {
-      setErr("Select a questions PDF/DOCX first.");
+      setErr("Select a questions PDF/DOCX file first.");
       return;
     }
 
     const name = qFile.name || "";
+    const lowerName = name.toLowerCase();
 
-    if (!name.toLowerCase().endsWith(".pdf") && !name.toLowerCase().endsWith(".docx")) {
+    if (!lowerName.endsWith(".pdf") && !lowerName.endsWith(".docx")) {
       setErr("Only PDF and DOCX question files are allowed.");
       return;
     }
@@ -300,6 +310,11 @@ export default function AssessmentDetail() {
       });
 
       setQFile(null);
+
+      if (questionInputRef.current) {
+        questionInputRef.current.value = "";
+      }
+
       setMessage(
         `Questions uploaded successfully. Extracted text length: ${
           res?.data?.extracted_len ?? 0
@@ -314,9 +329,32 @@ export default function AssessmentDetail() {
     }
   };
 
-  const generateExpected = async () => {
+  const deleteQuestionFile = async (fileId) => {
+    const ok = window.confirm("Delete this uploaded question file?");
+    if (!ok) return;
+
     setErr("");
     setMessage("");
+    setBusy(true);
+
+    try {
+      await api.delete(`/assessments/${id}/questions/${fileId}`);
+
+      setMessage("Question file deleted successfully.");
+
+      await load();
+    } catch (e) {
+      setErr(e?.response?.data?.detail || "Delete question file failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const generateExpected = async () => {
+    setErr("");
+    setMessage(
+      "AI is generating expected answers. This may take 30–90 seconds on a free model."
+    );
     setBusy(true);
 
     try {
@@ -331,6 +369,7 @@ export default function AssessmentDetail() {
       await load();
     } catch (e) {
       setErr(e?.response?.data?.detail || "Generate expected answers failed");
+      setMessage("");
     } finally {
       setBusy(false);
     }
@@ -362,6 +401,10 @@ export default function AssessmentDetail() {
 
       setZipFile(null);
 
+      if (zipInputRef.current) {
+        zipInputRef.current.value = "";
+      }
+
       setMessage(
         `ZIP extracted successfully. Files seen: ${
           res?.data?.files_seen ?? 0
@@ -378,23 +421,78 @@ export default function AssessmentDetail() {
     }
   };
 
-  const gradeAllSubmissions = async () => {
+  const uploadSingleSubmission = async () => {
     setErr("");
     setMessage("");
+
+    if (!singleSubmissionFile) {
+      setErr("Select a student answer file first.");
+      return;
+    }
+
+    const lowerName = singleSubmissionFile.name.toLowerCase();
+
+    if (
+      !lowerName.endsWith(".pdf") &&
+      !lowerName.endsWith(".docx") &&
+      !lowerName.endsWith(".txt") &&
+      !lowerName.endsWith(".md")
+    ) {
+      setErr("Only PDF, DOCX, TXT, and MD files are allowed.");
+      return;
+    }
+
+    setBusy(true);
+
+    try {
+      const form = new FormData();
+      form.append("file", singleSubmissionFile);
+
+      const res = await api.post(`/assessments/${id}/submissions/upload-file`, form, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+
+      setSingleSubmissionFile(null);
+
+      if (singleSubmissionInputRef.current) {
+        singleSubmissionInputRef.current.value = "";
+      }
+
+      setMessage(
+        `Single submission uploaded successfully. Roll no: ${
+          res?.data?.reg_no || "-"
+        }. Text extracted: ${res?.data?.text_chars ?? 0} characters.`
+      );
+
+      setSubmissionsRefreshKey((k) => k + 1);
+    } catch (e) {
+      setErr(e?.response?.data?.detail || "Single submission upload failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const gradeAllSubmissions = async () => {
+    setErr("");
+    setMessage(
+      "AI grading is running. Please wait and do not click again. Free models can take 30–120 seconds per submission. Check backend terminal for live progress logs."
+    );
     setBusy(true);
 
     try {
       const res = await api.post(`/assessments/${id}/grade-all`);
 
       setMessage(
-        `Grading completed. Graded: ${res?.data?.graded ?? 0}, failed: ${
-          res?.data?.failed ?? 0
-        }.`
+        res?.data?.message ||
+          `Grading completed. Graded: ${res?.data?.graded ?? 0}, failed: ${
+            res?.data?.failed ?? 0
+          }.`
       );
 
       setSubmissionsRefreshKey((k) => k + 1);
     } catch (e) {
       setErr(e?.response?.data?.detail || "Grade all failed");
+      setMessage("");
     } finally {
       setBusy(false);
     }
@@ -439,8 +537,8 @@ export default function AssessmentDetail() {
 
         <p style={styles.subtitle}>
           Upload the assessment question paper, generate AI expected answers,
-          upload student solutions as one ZIP file, and grade all submissions in
-          one run.
+          upload student solutions as one ZIP file, add late single submissions,
+          and grade all submissions in one run.
         </p>
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 14 }}>
@@ -493,14 +591,14 @@ export default function AssessmentDetail() {
 
           <StepCard
             no="3"
-            title="Upload ZIP"
+            title="Upload ZIP / Single File"
             status={
               <span style={styles.badge}>
                 {subStats.total ? `${subStats.total} submissions` : "Pending"}
               </span>
             }
           >
-            Upload all student solutions in one ZIP. Backend extracts and parses them.
+            Upload all student solutions through ZIP or add one late answer file.
           </StepCard>
 
           <StepCard
@@ -533,18 +631,33 @@ export default function AssessmentDetail() {
             </div>
 
             <p style={styles.muted}>
-              Accepted formats: PDF, DOCX. This file is used to generate expected
-              answers and CLO alignment.
+              Accepted formats: PDF and DOCX. This file is used to generate
+              expected answers and CLO alignment.
             </p>
 
             <input
+              ref={questionInputRef}
               type="file"
-              accept=".pdf,.docx"
-              onChange={(e) => setQFile(e.target.files?.[0] || null)}
+              accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              onChange={(e) => {
+                const selectedFile = e.currentTarget.files?.[0];
+
+                console.log("Selected question file:", selectedFile);
+
+                if (!selectedFile) {
+                  setQFile(null);
+                  setErr("No file was selected. Please choose the file again.");
+                  return;
+                }
+
+                setErr("");
+                setMessage("");
+                setQFile(selectedFile);
+              }}
             />
 
             <div style={{ ...styles.muted, marginTop: 8 }}>
-              Selected: <b>{qFile?.name || "No file selected"}</b>
+              Selected file: <b>{qFile ? qFile.name : "No file selected yet"}</b>
             </div>
 
             <button
@@ -591,9 +704,34 @@ export default function AssessmentDetail() {
               {!!(files || []).length ? (
                 <ul style={{ marginTop: 8, paddingLeft: 18 }}>
                   {(files || []).map((f) => (
-                    <li key={f.id}>
-                      {f.filename_original}{" "}
-                      <span style={styles.muted}>(ext: {f.ext})</span>
+                    <li
+                      key={f.id}
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 12,
+                        marginBottom: 8,
+                      }}
+                    >
+                      <span>
+                        {f.filename_original}{" "}
+                        <span style={styles.muted}>(ext: {f.ext})</span>
+                      </span>
+
+                      <button
+                        type="button"
+                        style={{
+                          ...styles.btn,
+                          padding: "6px 10px",
+                          color: "#991b1b",
+                          borderColor: "#fecaca",
+                        }}
+                        onClick={() => deleteQuestionFile(f.id)}
+                        disabled={busy}
+                      >
+                        Delete
+                      </button>
                     </li>
                   ))}
                 </ul>
@@ -694,11 +832,10 @@ export default function AssessmentDetail() {
           }}
         >
           <div>
-            <h3 style={styles.h3}>Student Submissions ZIP</h3>
+            <h3 style={styles.h3}>Student Submissions</h3>
             <p style={{ ...styles.muted, marginTop: 4 }}>
-              Upload one ZIP containing all student solutions. The backend will
-              unzip it, parse supported files, infer roll numbers, create/update
-              submissions, and then grade them.
+              Upload one ZIP containing all student solutions, or add a single
+              answer file later for late/missing submissions.
             </p>
           </div>
 
@@ -721,18 +858,32 @@ export default function AssessmentDetail() {
           >
             <div style={{ minWidth: 280 }}>
               <div style={{ fontWeight: 900, color: "#111827" }}>
-                Select ZIP File
+                Bulk Upload ZIP File
               </div>
 
               <input
+                ref={zipInputRef}
                 type="file"
-                accept=".zip"
-                onChange={(e) => setZipFile(e.target.files?.[0] || null)}
+                accept=".zip,application/zip,application/x-zip-compressed"
+                onChange={(e) => {
+                  const selectedFile = e.currentTarget.files?.[0];
+
+                  console.log("Selected ZIP file:", selectedFile);
+
+                  if (!selectedFile) {
+                    setZipFile(null);
+                    return;
+                  }
+
+                  setErr("");
+                  setMessage("");
+                  setZipFile(selectedFile);
+                }}
                 style={{ marginTop: 8 }}
               />
 
               <div style={{ ...styles.muted, marginTop: 8 }}>
-                Selected: <b>{zipFile?.name || "No ZIP selected"}</b>
+                Selected ZIP: <b>{zipFile ? zipFile.name : "No ZIP selected yet"}</b>
               </div>
             </div>
 
@@ -768,6 +919,64 @@ export default function AssessmentDetail() {
             >
               Refresh
             </button>
+
+            <div
+              style={{
+                marginTop: 16,
+                paddingTop: 16,
+                borderTop: "1px solid #e5e7eb",
+                width: "100%",
+              }}
+            >
+              <div style={{ fontWeight: 900, color: "#111827" }}>
+                Add Single Student Answer File
+              </div>
+
+              <p style={styles.muted}>
+                Use this when one student submits later or when you need to
+                add/update one answer file without uploading the full ZIP again.
+              </p>
+
+              <input
+                ref={singleSubmissionInputRef}
+                type="file"
+                accept=".pdf,.docx,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
+                onChange={(e) => {
+                  const selectedFile = e.currentTarget.files?.[0];
+
+                  if (!selectedFile) {
+                    setSingleSubmissionFile(null);
+                    return;
+                  }
+
+                  setErr("");
+                  setMessage("");
+                  setSingleSubmissionFile(selectedFile);
+                }}
+              />
+
+              <div style={{ ...styles.muted, marginTop: 8 }}>
+                Selected answer file:{" "}
+                <b>
+                  {singleSubmissionFile
+                    ? singleSubmissionFile.name
+                    : "No single answer file selected yet"}
+                </b>
+              </div>
+
+              <button
+                type="button"
+                style={{
+                  ...styles.btn,
+                  marginTop: 12,
+                  opacity: busy || !singleSubmissionFile ? 0.65 : 1,
+                }}
+                onClick={uploadSingleSubmission}
+                disabled={busy || !singleSubmissionFile}
+              >
+                {busy ? "Working..." : "Upload Single Answer File"}
+              </button>
+            </div>
           </div>
         </div>
 
@@ -784,17 +993,17 @@ export default function AssessmentDetail() {
         <p style={styles.muted}>
           In this module, the teacher first uploads the question paper. The
           system extracts text from the question file and generates expected
-          answers using AI. Then the teacher uploads all student solutions as a
-          single ZIP file. The backend safely extracts the ZIP, ignores unsafe
-          paths, reads supported files, detects student roll numbers from the
-          document text or filename, stores each submission, and grades every
-          submission against the generated expected answers.
+          answers using AI. Then the teacher can upload all student solutions as
+          a single ZIP file or add one student answer file later. The backend
+          safely extracts ZIP files, ignores unsafe paths, reads supported files,
+          detects student roll numbers from the document text or filename,
+          stores each submission, and grades every submission against the
+          generated expected answers.
         </p>
       </div>
     </div>
   );
 }
-
 
 function SubmissionsTable({ assessmentId, refreshKey, onStats }) {
   const [rows, setRows] = useState([]);
@@ -803,9 +1012,15 @@ function SubmissionsTable({ assessmentId, refreshKey, onStats }) {
 
   const calculateStats = (items) => {
     const total = items.length;
-    const graded = items.filter((x) => String(x.status || "").toLowerCase() === "graded").length;
-    const uploaded = items.filter((x) => String(x.status || "").toLowerCase() === "uploaded").length;
-    const error = items.filter((x) => String(x.status || "").toLowerCase() === "error").length;
+    const graded = items.filter(
+      (x) => String(x.status || "").toLowerCase() === "graded"
+    ).length;
+    const uploaded = items.filter(
+      (x) => String(x.status || "").toLowerCase() === "uploaded"
+    ).length;
+    const error = items.filter(
+      (x) => String(x.status || "").toLowerCase() === "error"
+    ).length;
 
     return {
       total,
@@ -866,16 +1081,18 @@ function SubmissionsTable({ assessmentId, refreshKey, onStats }) {
               <th style={{ ...styles.th, width: 210 }}>File</th>
               <th style={{ ...styles.th, width: 120 }}>Status</th>
               <th style={{ ...styles.th, width: 100 }}>Marks</th>
-              <th style={styles.th}>Feedback</th>
+              <th style={styles.th}>Feedback / Error</th>
             </tr>
           </thead>
 
           <tbody>
             {rows.map((r) => {
-              const fb = r.ai_feedback || "";
+              const errorMsg = r.evidence_json?.error || "";
+              const fb = r.ai_feedback || errorMsg || "";
               const marks = r.ai_marks ?? "-";
               const roll = getRollNo(r);
               const file = shortFileName(r);
+              const isError = String(r.status || "").toLowerCase() === "error";
 
               return (
                 <tr key={r.id}>
@@ -896,10 +1113,16 @@ function SubmissionsTable({ assessmentId, refreshKey, onStats }) {
 
                   <td style={{ ...styles.td, maxWidth: 720 }} title={fb}>
                     {fb ? (
-                      <>
+                      <span
+                        style={
+                          isError
+                            ? { color: "#991b1b", fontWeight: 800 }
+                            : undefined
+                        }
+                      >
                         {fb.slice(0, 260)}
                         {fb.length > 260 ? "..." : ""}
-                      </>
+                      </span>
                     ) : (
                       <span style={styles.muted}>No feedback yet</span>
                     )}
@@ -911,7 +1134,8 @@ function SubmissionsTable({ assessmentId, refreshKey, onStats }) {
             {!rows.length && (
               <tr>
                 <td colSpan={5} style={{ ...styles.td, color: "#6b7280" }}>
-                  No submissions yet. Upload a ZIP file to create submissions.
+                  No submissions yet. Upload a ZIP file or a single answer file
+                  to create submissions.
                 </td>
               </tr>
             )}

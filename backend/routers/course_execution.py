@@ -1,18 +1,25 @@
+# backend/routers/course_execution.py
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from typing import List
 from pathlib import Path
 import mimetypes
+import re
 from collections import Counter
+
 from services.weekly_zip_upload_service import handle_weekly_zip_upload
 from services.completeness_service import run_completeness
 
 from core.db import SessionLocal
 from .auth import get_current_user
+
 from models.course import Course
 from models.course_execution import WeeklyPlan, WeeklyExecution, DeviationLog
 from models.uploads import Upload, UploadFileItem
+from models.assessment import Assessment
+
 from schemas.course_execution import (
     WeeklyPlanOut,
     WeeklyPlanUpdate,
@@ -23,7 +30,11 @@ from schemas.course_execution import (
     DeviationOut,
     DeviationResolve,
 )
-from services.course_execution import generate_weekly_plan_from_guide, update_deviations_for_course
+
+from services.course_execution import (
+    generate_weekly_plan_from_guide,
+    update_deviations_for_course,
+)
 
 
 router = APIRouter(prefix="/courses", tags=["Course Execution"])
@@ -37,7 +48,186 @@ def get_db():
         db.close()
 
 
-# ---------- COURSE PLAN SETUP ----------
+# ======================================================
+# STATUS HELPERS
+# ======================================================
+
+def _has_text(value) -> bool:
+    return bool(str(value or "").strip())
+
+
+def _latest_week_upload(db: Session, course_id: str, week_no: int):
+    return (
+        db.query(Upload)
+        .filter(
+            Upload.course_id == course_id,
+            Upload.week_no == week_no,
+        )
+        .order_by(Upload.created_at.desc())
+        .first()
+    )
+
+
+def _weekly_upload_count(db: Session, course_id: str, week_no: int) -> int:
+    return (
+        db.query(Upload)
+        .filter(
+            Upload.course_id == course_id,
+            Upload.week_no == week_no,
+        )
+        .count()
+    )
+
+
+def _extract_week_from_text(value: str):
+    """
+    Best-effort week detection from assessment title/planned text.
+    Examples:
+    - Quiz 1
+    - Assignment 2
+    - Week 4 Quiz
+    - W5 Assignment
+    """
+    text = str(value or "").lower()
+
+    patterns = [
+        r"\bweek\s*0?([1-9]|1[0-6])\b",
+        r"\bw\s*0?([1-9]|1[0-6])\b",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return None
+
+    return None
+
+
+def _assessment_matches_week(plan, assessment: Assessment, week_no: int) -> bool:
+    """
+    Because Assessment model currently has no week_number column,
+    we use best-effort matching:
+
+    1. If title contains Week/W number, use that.
+    2. If weekly plan has start/end dates, compare assessment date.
+    3. If planned_assessments contains assessment type/title keywords, count it.
+    """
+
+    title_week = _extract_week_from_text(assessment.title or "")
+
+    if title_week == week_no:
+        return True
+
+    if plan and plan.planned_start_date and plan.planned_end_date and assessment.date:
+        try:
+            start_date = plan.planned_start_date.date()
+            end_date = plan.planned_end_date.date()
+
+            if start_date <= assessment.date <= end_date:
+                return True
+        except Exception:
+            pass
+
+    if plan and _has_text(plan.planned_assessments):
+        planned = str(plan.planned_assessments or "").lower()
+        atype = str(assessment.type or "").lower()
+        title = str(assessment.title or "").lower()
+
+        if atype and atype in planned:
+            return True
+
+        title_words = [w for w in re.split(r"\W+", title) if len(w) >= 4]
+        if title_words and any(w in planned for w in title_words):
+            return True
+
+    return False
+
+
+def _week_assessments(db: Session, course_id: str, week_no: int, plan):
+    all_assessments = (
+        db.query(Assessment)
+        .filter(Assessment.course_id == course_id)
+        .order_by(Assessment.date.asc())
+        .all()
+    )
+
+    matched = []
+
+    for a in all_assessments:
+        if _assessment_matches_week(plan, a, week_no):
+            matched.append(a)
+
+    return matched
+
+
+def _compute_week_status(plan, exe, upload, assessment_count: int) -> tuple[str, str]:
+    """
+    Correct QA status logic.
+
+    Planned topics alone do NOT mean on_track.
+
+    Status meaning:
+    - on_track: delivered text/evidence exists and teacher marks it on track
+    - uploaded_pending_review: upload or assessment evidence exists but no manual execution review yet
+    - missing_delivery: plan exists but no upload, no assessment, no delivered content
+    - not_started: no plan, no upload, no assessment, no delivery
+    """
+
+    has_plan = bool(plan and _has_text(plan.planned_topics))
+    has_upload = bool(upload)
+    has_assessment = assessment_count > 0
+
+    has_delivery_text = bool(
+        exe
+        and (
+            _has_text(getattr(exe, "delivered_topics", None))
+            or _has_text(getattr(exe, "delivered_assessments", None))
+            or _has_text(getattr(exe, "evidence_links", None))
+        )
+    )
+
+    if has_delivery_text:
+        status = getattr(exe, "coverage_status", None) or "on_track"
+        return status, "Manual execution update exists."
+
+    if has_upload and has_assessment:
+        return "uploaded_pending_review", "Weekly upload and assessment evidence exist, but execution has not been reviewed."
+
+    if has_upload:
+        return "uploaded_pending_review", "Weekly upload exists, but delivered topics have not been reviewed."
+
+    if has_assessment:
+        return "uploaded_pending_review", "Assessment evidence exists, but delivered topics have not been reviewed."
+
+    if has_plan:
+        return "missing_delivery", "Planned content exists, but no weekly upload, assessment, or delivered update has been recorded."
+
+    return "not_started", "No weekly plan, upload, assessment, or delivery update found."
+
+
+def _build_evidence_summary(upload_count: int, assessment_count: int, latest_upload_name: str | None) -> str:
+    parts = []
+
+    if upload_count:
+        label = "upload" if upload_count == 1 else "uploads"
+        if latest_upload_name:
+            parts.append(f"{upload_count} weekly {label}; latest: {latest_upload_name}")
+        else:
+            parts.append(f"{upload_count} weekly {label}")
+
+    if assessment_count:
+        label = "assessment" if assessment_count == 1 else "assessments"
+        parts.append(f"{assessment_count} {label} recorded")
+
+    return ", ".join(parts) if parts else ""
+
+
+# ======================================================
+# COURSE PLAN SETUP
+# ======================================================
 
 @router.post("/{course_id}/weekly-plan/generate-from-guide", response_model=List[WeeklyPlanOut])
 def generate_weekly_plan(
@@ -77,6 +267,7 @@ def update_weekly_plan(
     current=Depends(get_current_user),
 ):
     plan = db.get(WeeklyPlan, week_id)
+
     if not plan:
         raise HTTPException(status_code=404, detail="Weekly plan not found")
 
@@ -88,10 +279,13 @@ def update_weekly_plan(
     db.refresh(plan)
 
     update_deviations_for_course(db, plan.course_id)
+
     return plan
 
 
-# ---------- EXECUTION TRACKING ----------
+# ======================================================
+# EXECUTION TRACKING
+# ======================================================
 
 @router.post("/{course_id}/weekly-execution/{week_number}", response_model=WeeklyExecutionOut)
 def upsert_weekly_execution(
@@ -102,8 +296,12 @@ def upsert_weekly_execution(
     current=Depends(get_current_user),
 ):
     course = db.get(Course, course_id)
+
     if not course:
         raise HTTPException(status_code=404, detail="Course not found")
+
+    if week_number < 1 or week_number > 16:
+        raise HTTPException(status_code=400, detail="week_number must be 1..16")
 
     exec_obj = (
         db.query(WeeklyExecution)
@@ -117,14 +315,27 @@ def upsert_weekly_execution(
     if exec_obj is None:
         exec_obj = WeeklyExecution(course_id=course_id, week_number=week_number)
 
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    data = payload.model_dump(exclude_unset=True)
+
+    for field, value in data.items():
         setattr(exec_obj, field, value)
+
+    has_delivery = (
+        _has_text(getattr(exec_obj, "delivered_topics", None))
+        or _has_text(getattr(exec_obj, "delivered_assessments", None))
+        or _has_text(getattr(exec_obj, "evidence_links", None))
+    )
+
+    if not has_delivery:
+        exec_obj.coverage_status = "missing_delivery"
+        exec_obj.coverage_percent = 0
 
     db.add(exec_obj)
     db.commit()
     db.refresh(exec_obj)
 
     update_deviations_for_course(db, course_id)
+
     return exec_obj
 
 
@@ -154,6 +365,7 @@ def weekly_status_summary(
         .filter(WeeklyPlan.course_id == course_id)
         .all()
     }
+
     execs = {
         e.week_number: e
         for e in db.query(WeeklyExecution)
@@ -164,16 +376,28 @@ def weekly_status_summary(
     max_week = max(plans.keys() | execs.keys() | {16})
 
     items: list[WeeklyStatusItem] = []
+
     for w in range(1, max_week + 1):
         plan = plans.get(w)
         exe = execs.get(w)
 
-        if exe:
-            status_val = exe.coverage_status
-        elif plan:
-            status_val = "behind" if plan.planned_end_date else "on_track"
-        else:
-            status_val = "skipped"
+        latest_upload = _latest_week_upload(db, course_id, w)
+        upload_count = _weekly_upload_count(db, course_id, w)
+
+        week_assessments = _week_assessments(db, course_id, w, plan)
+        assessment_titles = [
+            f"{a.type}: {a.title}" if a.type else a.title
+            for a in week_assessments
+        ]
+
+        status_val, reason = _compute_week_status(
+            plan=plan,
+            exe=exe,
+            upload=latest_upload,
+            assessment_count=len(week_assessments),
+        )
+
+        latest_upload_name = latest_upload.filename_original if latest_upload else None
 
         items.append(
             WeeklyStatusItem(
@@ -183,13 +407,28 @@ def weekly_status_summary(
                 planned_assessments=plan.planned_assessments if plan else None,
                 delivered_assessments=exe.delivered_assessments if exe else None,
                 coverage_status=status_val,
+                has_upload=bool(latest_upload),
+                upload_count=upload_count,
+                latest_upload_id=str(latest_upload.id) if latest_upload else None,
+                latest_upload_name=latest_upload_name,
+                latest_upload_date=latest_upload.created_at if latest_upload else None,
+                assessment_count=len(week_assessments),
+                assessment_titles=assessment_titles,
+                evidence_summary=_build_evidence_summary(
+                    upload_count=upload_count,
+                    assessment_count=len(week_assessments),
+                    latest_upload_name=latest_upload_name,
+                ),
+                auto_reason=reason,
             )
         )
 
     return WeeklyStatusSummary(course_id=course_id, items=items)
 
 
-# ---------- DEVIATION HANDLING ----------
+# ======================================================
+# DEVIATION HANDLING
+# ======================================================
 
 @router.get("/{course_id}/deviations", response_model=List[DeviationOut])
 def list_deviations(
@@ -213,10 +452,12 @@ def resolve_deviation(
     current=Depends(get_current_user),
 ):
     dev = db.get(DeviationLog, deviation_id)
+
     if not dev:
         raise HTTPException(status_code=404, detail="Deviation not found")
 
     dev.resolved = payload.resolved
+
     if payload.resolved:
         dev.resolved_at = dev.resolved_at or dev.created_at
         dev.resolved_by = current["id"] if isinstance(current, dict) else str(current.id)
@@ -227,10 +468,14 @@ def resolve_deviation(
     db.add(dev)
     db.commit()
     db.refresh(dev)
+
     return dev
 
 
-# ✅ WEEKLY ZIP UPLOAD (Instructor)
+# ======================================================
+# WEEKLY ZIP UPLOAD
+# ======================================================
+
 @router.post("/{course_id}/weeks/{week_no}/weekly-zip")
 async def upload_weekly_zip(
     course_id: str,
@@ -243,12 +488,16 @@ async def upload_weekly_zip(
     role_l = role.lower()
 
     if not any(k in role_l for k in ["instructor", "faculty", "admin"]):
-        raise HTTPException(status_code=403, detail="Only instructor/faculty/admin can upload weekly zip.")
+        raise HTTPException(
+            status_code=403,
+            detail="Only instructor/faculty/admin can upload weekly zip.",
+        )
 
     if week_no < 1 or week_no > 16:
         raise HTTPException(status_code=400, detail="week_no must be 1..16")
 
     data = await file.read()
+
     if not data:
         raise HTTPException(status_code=400, detail="Empty file uploaded")
 
@@ -263,7 +512,6 @@ async def upload_weekly_zip(
         zip_filename=file.filename or f"week_{week_no}.zip",
     )
 
-    # ✅ AUTO-RUN completeness for weekly uploads
     try:
         comp = run_completeness(
             db=db,
@@ -275,10 +523,13 @@ async def upload_weekly_zip(
         comp = {"error": str(e)}
 
     out["completeness"] = comp
+
     return out
 
 
-# -------------------- NEW: Explorer APIs --------------------
+# ======================================================
+# EXPLORER APIs
+# ======================================================
 
 @router.get("/{course_id}/weeks/{week_no}/uploads")
 def list_weekly_uploads(
@@ -287,13 +538,16 @@ def list_weekly_uploads(
     db: Session = Depends(get_db),
     current=Depends(get_current_user),
 ):
-    # weekly uploads are Upload rows with week_no + file_type_guess=weekly_zip
-    q = (
+    rows = (
         db.query(Upload)
-        .filter(Upload.course_id == course_id, Upload.week_no == week_no)
+        .filter(
+            Upload.course_id == course_id,
+            Upload.week_no == week_no,
+        )
         .order_by(Upload.created_at.desc())
+        .all()
     )
-    rows = q.all()
+
     return [
         {
             "id": str(u.id),
@@ -313,17 +567,14 @@ def weekly_latest_bundle(
     db: Session = Depends(get_db),
     current=Depends(get_current_user),
 ):
-    # latest upload
-    up = (
-        db.query(Upload)
-        .filter(Upload.course_id == course_id, Upload.week_no == week_no)
-        .order_by(Upload.created_at.desc())
-        .first()
-    )
+    up = _latest_week_upload(db, course_id, week_no)
 
     exe = (
         db.query(WeeklyExecution)
-        .filter(WeeklyExecution.course_id == course_id, WeeklyExecution.week_number == week_no)
+        .filter(
+            WeeklyExecution.course_id == course_id,
+            WeeklyExecution.week_number == week_no,
+        )
         .first()
     )
 
@@ -331,9 +582,15 @@ def weekly_latest_bundle(
         return {"upload": None, "execution": None, "completeness": None}
 
     comp = None
+
     if up:
         try:
-            comp = run_completeness(db=db, course_id=course_id, upload_id=str(up.id), week_no=week_no)
+            comp = run_completeness(
+                db=db,
+                course_id=course_id,
+                upload_id=str(up.id),
+                week_no=week_no,
+            )
         except Exception as e:
             comp = {"error": str(e)}
 
@@ -362,6 +619,7 @@ def list_upload_files(
     current=Depends(get_current_user),
 ):
     up = db.get(Upload, upload_id)
+
     if not up:
         raise HTTPException(status_code=404, detail="Upload not found")
 
@@ -391,22 +649,22 @@ def download_upload_file(
     db: Session = Depends(get_db),
     current=Depends(get_current_user),
 ):
-    """
-    Streams a file out of the extracted folder.
-    We do NOT store extracted paths in DB, so we locate via Upload.parse_log safely.
-    """
     up = db.get(Upload, upload_id)
+
     if not up:
         raise HTTPException(status_code=404, detail="Upload not found")
 
     manifest = up.parse_log or []
-    filename = Path(filename).name  # sanitize
+    filename = Path(filename).name
 
     candidate = None
+
     for m in manifest:
         p = m.get("path")
+
         if not p:
             continue
+
         if Path(p).name == filename:
             candidate = p
             break
@@ -415,10 +673,12 @@ def download_upload_file(
         raise HTTPException(status_code=404, detail="File not found in this upload")
 
     fpath = Path(candidate)
+
     if not fpath.exists():
         raise HTTPException(status_code=404, detail="File is missing on server storage")
 
     ctype, _ = mimetypes.guess_type(str(fpath))
+
     return FileResponse(
         path=str(fpath),
         media_type=ctype or "application/octet-stream",
@@ -426,6 +686,9 @@ def download_upload_file(
     )
 
 
+# ======================================================
+# DASHBOARD WEEKLY PROGRESS
+# ======================================================
 
 @router.get("/{course_id}/weekly-progress")
 def weekly_progress(
@@ -438,51 +701,86 @@ def weekly_progress(
     missing_counter = Counter()
 
     for w in range(1, 17):
-        # latest upload for this week
-        up = (
-            db.query(Upload)
-            .filter(Upload.course_id == course_id, Upload.week_no == w)
-            .order_by(Upload.created_at.desc())
+        plan = (
+            db.query(WeeklyPlan)
+            .filter(
+                WeeklyPlan.course_id == course_id,
+                WeeklyPlan.week_number == w,
+            )
             .first()
         )
+
+        up = _latest_week_upload(db, course_id, w)
+        upload_count = _weekly_upload_count(db, course_id, w)
 
         exe = (
             db.query(WeeklyExecution)
-            .filter(WeeklyExecution.course_id == course_id, WeeklyExecution.week_number == w)
+            .filter(
+                WeeklyExecution.course_id == course_id,
+                WeeklyExecution.week_number == w,
+            )
             .first()
         )
 
+        week_assessments = _week_assessments(db, course_id, w, plan)
+
         coverage_percent = float(exe.coverage_percent or 0) if exe else 0.0
-        coverage_status = exe.coverage_status if exe else ("skipped" if not up else "behind")
+        coverage_status, reason = _compute_week_status(
+            plan=plan,
+            exe=exe,
+            upload=up,
+            assessment_count=len(week_assessments),
+        )
 
         completeness_percent = None
+
         if up:
             try:
-                comp = run_completeness(db=db, course_id=course_id, upload_id=str(up.id), week_no=w)
-                completeness_percent = float(comp.get("score_percent")) if isinstance(comp, dict) and comp.get("score_percent") is not None else None
+                comp = run_completeness(
+                    db=db,
+                    course_id=course_id,
+                    upload_id=str(up.id),
+                    week_no=w,
+                )
+
+                completeness_percent = (
+                    float(comp.get("score_percent"))
+                    if isinstance(comp, dict) and comp.get("score_percent") is not None
+                    else None
+                )
             except Exception:
                 completeness_percent = None
 
-        if coverage_status == "behind":
+        if coverage_status in {"behind", "missing_delivery"}:
             weeks_behind.append(w)
 
-        # aggregate missing topics
         if exe and exe.missing_topics:
             for line in (exe.missing_topics or "").split("\n"):
                 t = line.strip().lower()
+
                 if t:
                     missing_counter[t] += 1
 
-        weeks.append({
-            "week_no": w,
-            "has_upload": bool(up),
-            "upload_id": str(up.id) if up else None,
-            "coverage_percent": round(coverage_percent, 2),
-            "coverage_status": coverage_status,
-            "completeness_percent": round(completeness_percent, 2) if completeness_percent is not None else None,
-        })
+        weeks.append(
+            {
+                "week_no": w,
+                "has_upload": bool(up),
+                "upload_count": upload_count,
+                "upload_id": str(up.id) if up else None,
+                "assessment_count": len(week_assessments),
+                "coverage_percent": round(coverage_percent, 2),
+                "coverage_status": coverage_status,
+                "auto_reason": reason,
+                "completeness_percent": round(completeness_percent, 2)
+                if completeness_percent is not None
+                else None,
+            }
+        )
 
-    top_missing = [{"topic": k, "count": v} for k, v in missing_counter.most_common(20)]
+    top_missing = [
+        {"topic": k, "count": v}
+        for k, v in missing_counter.most_common(20)
+    ]
 
     return {
         "course_id": course_id,
