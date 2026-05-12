@@ -9,7 +9,7 @@ six==1.17.0
 sniffio==1.3.1
 typing_extensions==4.15.0
 tzdata==2025.2
-
+psycopg2-binary>=2.9.9
 # FastAPI stack - Python 3.14 compatible
 fastapi==0.121.3
 starlette==0.50.0
